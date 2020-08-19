@@ -40,18 +40,6 @@ logError() {
   log "$@" "ERROR"
 }
 
-installDependencies() {
-  runInstall=0
-  command -v ping > /dev/null 2>&1 || runInstall=1
-
-  if [ ${runInstall} -eq 1 ]; then
-    apt-get update \
-    && apt-get install -y \
-      inetutils-ping
-    apt-get clean
-  fi
-}
-
 getEndpoints() {
     etcdPort=${1:-{{ .Values.clientPort }}}
     withPrefix=${2:-0}
@@ -103,7 +91,7 @@ removeMember() {
 runEtcd() {
   etcdMode=${1}
   log "Starting etcd node ${etcdMode}..."
-  etcdRunOptions=" \
+  etcdDefaultOptions=" \
 --name ${HOSTNAME} \
 --pre-vote=true \
 --strict-reconfig-check=false \
@@ -111,15 +99,15 @@ runEtcd() {
 --listen-peer-urls={{ $etcdPeerProtocol }}://${HOST_IP}:{{ .Values.peerPort }} \
 --listen-client-urls={{ $etcdClientProtocol }}://${HOST_IP}:{{ .Values.clientPort }},http://127.0.0.1:{{ .Values.clientPort }} \
 --advertise-client-urls={{ $etcdClientProtocol }}://${HOSTNAME}.${SET_NAME}:{{ .Values.clientPort }}"
-  etcdVoterRunOptions=" \
+  etcdVoterOptions=" \
 --initial-cluster=$(getEndpoints '{{ .Values.peerPort }}' '1') \
 --initial-advertise-peer-urls={{ $etcdPeerProtocol }}://${HOSTNAME}.${SET_NAME}:{{ .Values.peerPort }}"
 
   case "${etcdMode}" in
-    "init")        etcdRunOptions="${etcdRunOptions} ${etcdVoterRunOptions} --initial-cluster-token={{ template "etcd.fullname" . }} --initial-cluster-state=new";;
-    "addVoter")    etcdRunOptions="${etcdRunOptions} ${etcdVoterRunOptions} --initial-cluster-state=existing";;
-    "addNonVoter") ;;
-    *)      logError "Unsupported etcd mode called on runEtcd '${etcdMode}'"; exit 1;;
+    "init")        etcdRunOptions="${etcdDefaultOptions} ${etcdVoterOptions} --initial-cluster-token={{ template "etcd.fullname" . }} --initial-cluster-state=new";;
+    "addVoter")    etcdRunOptions="${etcdDefaultOptions} ${etcdVoterOptions} --initial-cluster-state=existing";;
+    "addNonVoter") etcdRunOptions=${etcdDefaultOptions};;
+    *)             logError "Unsupported etcd mode called on runEtcd '${etcdMode}'"; exit 1;;
   esac
 
   echo "Run options: ${etcdRunOptions}"
@@ -131,22 +119,9 @@ cleanUpData() {
   rm -vrf ${DATA_DIR_PATH}
 }
 
-waitForPods() {
-  log "Waiting for all initial pods to come up..."
-  for i in $(seq 0 2); do
-      while true; do
-          logDebug "Waiting for ${SET_NAME}-${i}.${SET_NAME} to come up"
-          ping -W 1 -c 1 ${SET_NAME}-${i}.${SET_NAME} > /dev/null && break
-          sleep 1s
-      done
-      logDebug "pod ${SET_NAME}-${i}.${SET_NAME} is up"
-  done
-}
-
 start() {
   log "Starting Etcd node..."
-  waitForPods
-  memberId=$(getMemberId)
+  memberId=$(getMemberId 3)
   if [ ! -z "${memberId}" ]; then
     removeMember "${memberId}" \
     && cleanUpData \
@@ -174,7 +149,7 @@ stop() {
   if [ "${SET_ID}" -gt 2   ]; then
     # nonvoter
     memberId="$(getMemberId)"
-    removeMember "${memberId}" || exit 14
+    removeMember "${memberId}"
   fi
   if [ -d ${DATA_DIR_PATH} ] && [ ${KEEP_EXISTING_DATA} = "false" ]; then
     cleanUpData
@@ -191,13 +166,11 @@ runCommand() {
   fi
 }
 
-if [ ${ETCD_DEBUG} = "true" ]
-then
+if [ ${ETCD_DEBUG} = "true" ]; then
   set -ex
 else
   set -e
 fi
 
 export ETCDCTL_ENDPOINTS=${ETCDCTL_ENDPOINTS:-"$(getEndpoints)"}
-installDependencies
 runCommand $@
