@@ -1,21 +1,15 @@
-# Default values for etcd.
-# This is a YAML-formatted file.
-# Declare name/value pairs to be passed into your templates.
-# name: value
+# nameOverride:
+# fullnameOverride:
 
-peerPort: 2380
-clientPort: 2379
-component: "etcd"
-replicas: 3
 image:
-  repository: "k8s.gcr.io/etcd-amd64"
-  tag: "3.2.26"
+  repository: "quay.io/coreos/etcd"
+  tag: "v3.4.10"
   pullPolicy: "IfNotPresent"
+
+## must not be less than 3. A etcd cluster works only if there are at least 3 nodes. This is then the initial cluster of voters.
+replicas: 3
+
 resources: {}
-# We usually recommend not to specify default resources and to leave this as a conscious
-# choice for the user. This also increases chances charts run on environments with little
-# resources, such as Minikube. If you do want to specify resources, uncomment the following
-# lines, adjust them as necessary, and remove the curly braces after 'resources:'.
 # limits:
 #  cpu: 100m
 #  memory: 128Mi
@@ -54,15 +48,44 @@ persistentVolume:
   ##
   # storageClass: "-"
 
+## Keeps data on disk on node shutdown if persistentVolume is enabled. useful if after a node restart you want rather to continue with existing data from disk than a full sync from cluster.
+keepExistingData: false
+
 ## This is only available when persistentVolume is false:
 ## If persistentVolume is not enabled, one can choose to use memory mode for ETCD by setting memoryMode to "true".
 ## The system will create a volume with "medium: Memory"
 memoryMode: false
 
+## Specify ‘zap’ for structured logging or ‘capnslog’.
+## WARNING: --logger=capnslog to be deprecated in v3.5.
+logger: zap
+
+## Configures log level. Only supports debug, info, warn, error, panic, or fatal.
+logLevel: info
+
+## Drop the default log level to DEBUG for all subpackages.
+## default: false (INFO for all packages)
+debugMode: false
+
+## Set level of detail for exported metrics, specify ‘extensive’ to include server side grpc histogram metrics.
+## default: basic
+metrics: basic
+
 ## Node labels and tolerations for pod assignment
 ## ref: https://kubernetes.io/docs/concepts/configuration/assign-pod-node/#nodeselector
 ## ref: https://kubernetes.io/docs/concepts/configuration/assign-pod-node/#taints-and-tolerations-beta-feature
+annotations: {}
 nodeSelector: {}
 tolerations: []
 affinity: {}
 extraEnv: []
+
+service:
+  annotations: {}
+    # prometheus.io/scrape: 'true'
+    # prometheus.io/path: '/metrics'
+    # prometheus.io/port: '2379'
+
+## do not change unless you knwo what you are doing
+peerPort: 2380
+clientPort: 2379

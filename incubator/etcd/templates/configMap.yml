@@ -1,0 +1,19 @@
+{{- $root := . }}
+{{- $files := .Files }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ template "etcd.fullname" . }}
+  labels:
+    heritage: {{ .Release.Service | quote }}
+    release: {{ .Release.Name | quote }}
+    chart: "{{ .Chart.Name }}-{{ .Chart.Version }}"
+    app: {{ template "etcd.name" . }}
+    app.kubernetes.io/name: {{ template "etcd.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+data:
+{{- range $path, $bytes := .Files.Glob "files/*" }}
+{{- $fcontent := $files.Get $path }}
+  {{ base $path }}: |-
+{{ tpl $fcontent $root | indent 4 }}
+{{- end }}

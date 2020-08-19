@@ -1,0 +1,203 @@
+{{- $etcdPeerProtocol := include "etcd.peerProtocol" . -}}
+{{- $etcdClientProtocol := include "etcd.clientProtocol" . -}}
+{{- $etcdAuthOptions := include "etcd.authOptions" . -}}
+#!/bin/sh
+
+HOSTNAME=${HOSTNAME:-$(hostname)}
+HOST_IP=${HOST_IP:-$(hostname -i)}
+AUTH_OPTIONS=${AUTH_OPTIONS:-"{{ $etcdAuthOptions }}"}
+SET_ID=${HOSTNAME##*[^0-9]}
+DATA_DIR_PATH=${DATA_DIR_PATH:-/var/run/etcd/default.etcd}
+KEEP_EXISTING_DATA=${KEEP_EXISTING_DATA:-"false"}
+LOGGING_DEVICE_STDOUT=${LOGGING_DEVICE_STDOUT:-/proc/$$/fd/1}
+LOGGING_DEVICE_STDERR=${LOGGING_DEVICE_STDERR:-/proc/$$/fd/2}
+ETCD_LOG_LEVEL=$(echo ${ETCD_LOG_LEVEL:-"info"} | tr '[:upper:]' '[:lower:]')
+ETCD_DEBUG=${ETCD_DEBUG:-0}
+
+log() {
+  msg=${1}
+  severity=${2:-"INFO"}
+
+  case "${severity}" in
+    "ERROR") logDevice=${LOGGING_DEVICE_STDERR};;
+    *)       logDevice=${LOGGING_DEVICE_STDOUT};;
+  esac
+
+  case "${ETCD_LOG_LEVEL}" in
+    "info")    ( test "${severity}" = "DEBUG" ) && return 0;;
+    "warning") ( test "${severity}" = "DEBUG" || "${severity}" = "INFO" ) && return 0;;
+    "error")   ( test "${severity}" = "ERROR" ) || return 0;;
+  esac
+
+  echo "[${severity}] ${msg}" > ${logDevice}
+}
+
+logDebug() {
+  log "$@" "DEBUG"
+}
+
+logError() {
+  log "$@" "ERROR"
+}
+
+installDependencies() {
+  runInstall=0
+  command -v ping > /dev/null 2>&1 || runInstall=1
+
+  if [ ${runInstall} -eq 1 ]; then
+    apt-get update \
+    && apt-get install -y \
+      inetutils-ping
+    apt-get clean
+  fi
+}
+
+getEndpoints() {
+    etcdPort=${1:-{{ .Values.clientPort }}}
+    withPrefix=${2:-0}
+    EPS=""
+    for i in $(seq 0 2); do
+        endPointPrefix=""
+        if [ ${withPrefix} -eq 1 ]; then
+          endPointPrefix="${SET_NAME}-${i}="
+        fi
+        EPS="${EPS}${EPS:+,}${endPointPrefix}{{ $etcdPeerProtocol }}://${SET_NAME}-${i}.${SET_NAME}:${etcdPort}"
+    done
+    logDebug "Generated endpoints: ${EPS}"
+    echo ${EPS}
+}
+
+getMemberId() {
+    getMemberIdRetries=${1:-"10"}
+    log "Getting member id..."
+    while [ ${getMemberIdRetries} -gt 0 ]; do
+      logDebug "getMemberId waiting for member list (retries ${getMemberIdRetries})..."
+      etcdctl ${AUTH_OPTIONS} member list > /dev/null 2>&1 && break; sleep 1; getMemberIdRetries=$((${getMemberIdRetries} - 1));
+      logDebug "getMemberId got no valid response from cluster"
+    done
+    result=$(etcdctl ${AUTH_OPTIONS} member list 2>${LOGGING_DEVICE_STDERR} | grep ${HOSTNAME}.${SET_NAME} | cut -d ',' -f1)
+    if [ -z "${result}" ]; then
+      logDebug "getMemberId got no id"
+      return 0
+    fi
+    logDebug "getMemberId got member id: ${result}"
+    echo ${result}
+    return 0
+}
+
+addMember() {
+  logDebug "Adding new member to existing etcd cluster..."
+  etcdctl ${AUTH_OPTIONS} member add ${HOSTNAME} --peer-urls={{ $etcdPeerProtocol }}://${HOSTNAME}.${SET_NAME}:{{ .Values.peerPort }} 1>${LOGGING_DEVICE_STDOUT} 2>${LOGGING_DEVICE_STDERR}
+}
+
+removeMember() {
+  removeMemberId=${1}
+  log "Removing myself from etcd cluster"
+  etcdctl ${AUTH_OPTIONS} member remove ${removeMemberId} 1>${LOGGING_DEVICE_STDOUT} 2>${LOGGING_DEVICE_STDERR}
+  if [ $? -eq 0 ] && [ "${DELETE_DATA_ON_REMOVE_MEMBER}" = "true" ]; then
+      echo "Removing etcd data from node..."
+      rm -vrf /var/run/etcd/*
+  fi
+}
+
+runEtcd() {
+  etcdMode=${1}
+  log "Starting etcd node ${etcdMode}..."
+  etcdRunOptions=" \
+--name ${HOSTNAME} \
+--pre-vote=true \
+--strict-reconfig-check=false \
+--data-dir=${DATA_DIR_PATH} \
+--listen-peer-urls={{ $etcdPeerProtocol }}://${HOST_IP}:{{ .Values.peerPort }} \
+--listen-client-urls={{ $etcdClientProtocol }}://${HOST_IP}:{{ .Values.clientPort }},http://127.0.0.1:{{ .Values.clientPort }} \
+--advertise-client-urls={{ $etcdClientProtocol }}://${HOSTNAME}.${SET_NAME}:{{ .Values.clientPort }}"
+  etcdVoterRunOptions=" \
+--initial-cluster=$(getEndpoints '{{ .Values.peerPort }}' '1') \
+--initial-advertise-peer-urls={{ $etcdPeerProtocol }}://${HOSTNAME}.${SET_NAME}:{{ .Values.peerPort }}"
+
+  case "${etcdMode}" in
+    "init")        etcdRunOptions="${etcdRunOptions} ${etcdVoterRunOptions} --initial-cluster-token={{ template "etcd.fullname" . }} --initial-cluster-state=new";;
+    "addVoter")    etcdRunOptions="${etcdRunOptions} ${etcdVoterRunOptions} --initial-cluster-state=existing";;
+    "addNonVoter") ;;
+    *)      logError "Unsupported etcd mode called on runEtcd '${etcdMode}'"; exit 1;;
+  esac
+
+  echo "Run options: ${etcdRunOptions}"
+  exec etcd ${etcdRunOptions}
+}
+
+cleanUpData() {
+  log "Cleaning up data dir ${DATA_DIR_PATH}"
+  rm -vrf ${DATA_DIR_PATH}
+}
+
+waitForPods() {
+  log "Waiting for all initial pods to come up..."
+  for i in $(seq 0 2); do
+      while true; do
+          logDebug "Waiting for ${SET_NAME}-${i}.${SET_NAME} to come up"
+          ping -W 1 -c 1 ${SET_NAME}-${i}.${SET_NAME} > /dev/null && break
+          sleep 1s
+      done
+      logDebug "pod ${SET_NAME}-${i}.${SET_NAME} is up"
+  done
+}
+
+start() {
+  log "Starting Etcd node..."
+  waitForPods
+  memberId=$(getMemberId)
+  if [ ! -z "${memberId}" ]; then
+    removeMember "${memberId}" \
+    && cleanUpData \
+    && addMember || true
+    if [ ${SET_ID} -le 2 ]; then
+      log "Re-joining voter..."
+      runEtcd "addVoter"
+    else
+      log "Re-joining nonvoter..."
+      runEtcd "addNonVoter"
+    fi
+  fi
+
+  if [ ${SET_ID} -le 2 ]; then
+    log "Joining voter to initial cluster..."
+    runEtcd "init"
+  else
+    log "Joining nonvoter to existing cluster..."
+    runEtcd "addNonVoter"
+  fi
+}
+
+stop() {
+  log "Stopping node..."
+  if [ "${SET_ID}" -gt 2   ]; then
+    # nonvoter
+    memberId="$(getMemberId)"
+    removeMember "${memberId}" || exit 14
+  fi
+  if [ -d ${DATA_DIR_PATH} ] && [ ${KEEP_EXISTING_DATA} = "false" ]; then
+    cleanUpData
+  fi
+}
+
+runCommand() {
+  if type ${1%% *} 2>&1 | grep 'function' > /dev/null; then
+    log "Executing k8stools function ${1}"
+    $@
+  else
+    log "Executing system call ${1}"
+    exec $@
+  fi
+}
+
+if [ ${ETCD_DEBUG} = "true" ]
+then
+  set -ex
+else
+  set -e
+fi
+
+export ETCDCTL_ENDPOINTS=${ETCDCTL_ENDPOINTS:-"$(getEndpoints)"}
+installDependencies
+runCommand $@
